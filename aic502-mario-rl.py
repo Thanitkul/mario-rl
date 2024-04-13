@@ -1,4 +1,6 @@
+import gym.version
 import torch
+print(torch.__version__) # LOG: runnable with version 2.1.0+cu121 / 2.1.0+cpu / 2.1.1+cu121
 from torch import nn
 from torchvision import transforms as T
 from PIL import Image
@@ -20,8 +22,23 @@ from gym.wrappers.monitoring.video_recorder import VideoRecorder
 # Super Mario environment for OpenAI Gym
 import gym_super_mario_bros
 
+from tensordict import TensorDict
+from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
 
-env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0")
+import matplotlib.pyplot as plt
+from PIL import Image
+print(gym.__version__)
+
+
+
+if gym.__version__ < '0.26':
+    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", new_step_api=True)
+    print(1)
+else:
+    env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='rgb_array', apply_api_compatibility=True)
+    print(2)
+
+SAVE_PATH = '/mario_net_last.chkpt'
 
 # Limit the action-space to
 #   0. walk right
@@ -29,32 +46,28 @@ env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0")
 env = JoypadSpace(env, [["right"], ["right", "A"]])
 
 env.reset()
-# next_state, reward, done, info= env.step(action=0)
-# print(f"{next_state.shape},\n {reward},\n {done},\n {info}")
+next_state, reward, done, trunc, info = env.step(action=0)
+print(f"{next_state.shape},\n {reward},\n {done},\n {info}")
 
-"""
-from pyvirtualdisplay import Display
-
-virtual_display = Display(visible=0, size=(1400, 900))
-virtual_display.start()
 
 class SkipFrame(gym.Wrapper):
     def __init__(self, env, skip):
+        """Return only every `skip`-th frame"""
         super().__init__(env)
         self._skip = skip
 
     def step(self, action):
+        """Repeat action, and sum reward"""
         total_reward = 0.0
-        done = False
         for i in range(self._skip):
             # Accumulate reward and repeat the same action
-            obs, reward, done, info = self.env.step(action)
+            obs, reward, done, trunk, info = self.env.step(action)
             total_reward += reward
             if done:
                 break
-        return obs, total_reward, done, info
+        return obs, total_reward, done, trunk, info
 
-
+    
 class GrayScaleObservation(gym.ObservationWrapper):
     def __init__(self, env):
         super().__init__(env)
@@ -97,9 +110,11 @@ class ResizeObservation(gym.ObservationWrapper):
 env = SkipFrame(env, skip=4)
 env = GrayScaleObservation(env)
 env = ResizeObservation(env, shape=84)
-env = FrameStack(env, num_stack=4)
+if gym.__version__ < '0.26':
+    env = FrameStack(env, num_stack=4, new_step_api=True)
+else:
+    env = FrameStack(env, num_stack=4)  
 
-"""
 
 """After applying the above wrappers to the environment, the final wrapped
 state consists of 4 gray-scaled consecutive frames stacked together, as
@@ -125,19 +140,154 @@ should be able to:
 
 -  **Learn** a better action policy over time
 """
+state = env.reset()
 
-import torch
-import torch.nn as nn
-import torch.optim as optim
-import copy
-import numpy as np
-from collections import deque
-import random
+# if gym.__version__ > '0.26': render got no rgb_array arg
+# img = env.render("rgb_array").copy() # IMPORTANT: render keep modifying the same object
+img = env.render().copy() # IMPORTANT: render keep modifying the same object
+
+print(img.shape)
+
+plt.imshow(img)
+
+
+def first_if_tuple(x):
+    return x[0] if isinstance(x, tuple) else x
+print(env.action_space)
+print(env.action_space.n)
+
+print(first_if_tuple(state).shape)
+print(env.action_space.n)
+
+print("HERE")
+
+
+state = env.reset()
+next_state, reward, done, trunc, info = env.step(action=1)
+next_state, reward, done, trunc, info = env.step(action=1)
+next_state, reward, done, trunc, info = env.step(action=1)
+print(f"{first_if_tuple(next_state).shape},\n {reward},\n {done},\n {info}")
+img2 = env.render()
+print(img2.shape)
+plt.imshow(img2)
+
+np.any(img != img2)
+
+class Mario:
+    def __init__():
+        pass
+
+    def act(self, state):
+        """Given a state, choose an epsilon-greedy action"""
+        pass
+
+    def cache(self, experience):
+        """Add the experience to memory"""
+        pass
+
+    def recall(self):
+        """Sample experiences from memory"""
+        pass
+
+    def learn(self):
+        """Update online action value (Q) function with a batch of experiences"""
+        pass
+
+class Mario:
+    def __init__(self, state_dim, action_dim, save_dir):
+        self.state_dim = state_dim
+        self.action_dim = action_dim
+        self.save_dir = save_dir
+
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # Mario's DNN to predict the most optimal action - we implement this in the Learn section
+        self.net = MarioNet(self.state_dim, self.action_dim).float()
+        self.net = self.net.to(device=self.device)
+
+        self.exploration_rate = 1
+        self.exploration_rate_decay = 0.99999975
+        self.exploration_rate_min = 0.1
+        self.curr_step = 0
+
+        self.save_every = 25000  # no. of steps of experiences between saving Mario Net
+
+        self.use_cuda = torch.cuda.is_available()
+
+    def act(self, state):
+        """
+    Given a state, choose an epsilon-greedy action and update value of step.
+
+    Inputs:
+    state(``LazyFrame``): A single observation of the current state, dimension is (state_dim)
+    Outputs:
+    ``action_idx`` (``int``): An integer representing which action Mario will perform
+    """
+        # EXPLORE
+        if np.random.rand() < self.exploration_rate:
+            action_idx = np.random.randint(self.action_dim)
+
+        # EXPLOIT
+        else:
+            state = state[0].__array__() if isinstance(state, tuple) else state.__array__()
+            state = torch.tensor(state, device=self.device).unsqueeze(0)
+            action_values = self.net(state, model="online")
+            action_idx = torch.argmax(action_values, axis=1).item()
+
+        # decrease exploration_rate
+        self.exploration_rate *= self.exploration_rate_decay
+        self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
+
+        # increment step
+        self.curr_step += 1
+        return action_idx
+    
+class Mario(Mario):  # subclassing for continuity
+    def __init__(self, state_dim, action_dim, save_dir):
+        super().__init__(state_dim, action_dim, save_dir)
+        self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+        self.batch_size = 32
+
+    def cache(self, state, next_state, action, reward, done):
+        """
+        Store the experience to self.memory (replay buffer)
+
+        Inputs:
+        state (``LazyFrame``),
+        next_state (``LazyFrame``),
+        action (``int``),
+        reward (``float``),
+        done(``bool``))
+        """
+        
+        state = first_if_tuple(state).__array__()
+        next_state = first_if_tuple(next_state).__array__()
+
+        state = torch.tensor(state)
+        next_state = torch.tensor(next_state)
+        action = torch.tensor([action])
+        reward = torch.tensor([reward])
+        done = torch.tensor([done])
+
+        # self.memory.append((state, next_state, action, reward, done,))
+        self.memory.add(TensorDict({"state": state, "next_state": next_state, "action": action, "reward": reward, "done": done}, batch_size=[]))
+
+    def recall(self):
+        """
+        Retrieve a batch of experiences from memory
+        """
+
+        # batch = random.sample(self.memory, self.batch_size)
+        # state, next_state, action, reward, done = map(torch.stack, zip(*batch))
+
+        batch = self.memory.sample(self.batch_size).to(self.device)
+        state, next_state, action, reward, done = (batch.get(key) for key in ("state", "next_state", "action", "reward", "done"))
+        return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
 
 class MarioNet(nn.Module):
     """mini CNN structure
-    input -> (conv2d + relu) x 3 -> flatten -> (dense + relu) x 2 -> output
-    """
+  input -> (conv2d + relu) x 3 -> flatten -> (dense + relu) x 2 -> output
+  """
 
     def __init__(self, input_dim, output_dim):
         super().__init__()
@@ -158,15 +308,7 @@ class MarioNet(nn.Module):
             nn.Flatten(),
             nn.Linear(3136, 512),
             nn.ReLU(),
-            nn.Linear(512, 256),  # Added layer
-            nn.ReLU(),
-            nn.Linear(256, 128),  # Added layer
-            nn.ReLU(),
-            nn.Linear(128, 64),   # Added layer
-            nn.ReLU(),
-            nn.Linear(64, 32),    # Added layer
-            nn.ReLU(),
-            nn.Linear(32, output_dim),
+            nn.Linear(512, output_dim),
         )
 
         self.target = copy.deepcopy(self.online)
@@ -180,105 +322,11 @@ class MarioNet(nn.Module):
             return self.online(input)
         elif model == "target":
             return self.target(input)
-
-class Mario:
+        
+class Mario(Mario):
     def __init__(self, state_dim, action_dim, save_dir):
-        self.state_dim = state_dim
-        self.action_dim = action_dim
-        self.save_dir = save_dir
-        self.memory = deque(maxlen=100000)
-        self.batch_size = 128
+        super().__init__(state_dim, action_dim, save_dir)
         self.gamma = 0.9
-        self.net = MarioNet(self.state_dim, self.action_dim).float().cuda()
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
-        self.loss_fn = torch.nn.SmoothL1Loss()
-        self.burnin = 1e4  # min. experiences before training
-        self.learn_every = 3  # no. of experiences between updates to Q_online
-        self.sync_every = 1e4  # no. of experiences between Q_target & Q_online sync
-
-        self.use_cuda = torch.cuda.is_available()
-
-        # Mario's DNN to predict the most optimal action - we implement this in the Learn section
-        self.net = MarioNet(self.state_dim, self.action_dim).float()
-        if self.use_cuda:
-            self.net = self.net.to(device="cuda")
-
-        self.exploration_rate = 2
-        self.exploration_rate_decay = 0.95
-        self.exploration_rate_min = 0.00001
-        self.curr_step = 0
-
-        self.save_every = 15000  # no. of experiences between saving Mario Net
-
-    def act(self, state):
-        """
-        Given a state, choose an epsilon-greedy action and update value of step.
-
-        Inputs:
-        state(LazyFrame): A single observation of the current state, dimension is (state_dim)
-        Outputs:
-        action_idx (int): An integer representing which action Mario will perform
-        """
-        # EXPLORE
-        if np.random.rand() < self.exploration_rate:
-            action_idx = np.random.randint(self.action_dim)
-
-        # EXPLOIT
-        else:
-            state = state.__array__()
-            if self.use_cuda:
-                state = torch.tensor(state).cuda()
-            else:
-                state = torch.tensor(state)
-            state = state.unsqueeze(0)
-            action_values = self.net(state, model="online")
-            action_idx = torch.argmax(action_values, axis=1).item()
-
-        # decrease exploration_rate
-        self.exploration_rate *= self.exploration_rate_decay
-        self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
-
-        # increment step
-        self.curr_step += 1
-        return action_idx
-    
-    def cache(self, state, next_state, action, reward, done):
-        """
-        Store the experience to self.memory (replay buffer)
-
-        Inputs:
-        state (LazyFrame),
-        next_state (LazyFrame),
-        action (int),
-        reward (float),
-        done(bool))
-        """
-        state = state.__array__()
-        next_state = next_state.__array__()
-
-        if self.use_cuda:
-            state = torch.tensor(state).cuda()
-            next_state = torch.tensor(next_state).cuda()
-            action = torch.tensor([action]).cuda()
-            reward = torch.tensor([reward]).cuda()
-            done = torch.tensor([done]).cuda()
-        else:
-            state = torch.tensor(state)
-            next_state = torch.tensor(next_state)
-            action = torch.tensor([action])
-            reward = torch.tensor([reward])
-            done = torch.tensor([done])
-
-        self.memory.append((state, next_state, action, reward, done,))
-
-    def recall(self):
-        """
-        Retrieve a batch of experiences from memory
-        """
-        batch = random.sample(self.memory, self.batch_size)
-        state, next_state, action, reward, done = map(torch.stack, zip(*batch))
-        return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
-
 
     def td_estimate(self, state, action):
         current_Q = self.net(state, model="online")[
@@ -294,6 +342,12 @@ class Mario:
             np.arange(0, self.batch_size), best_action
         ]
         return (reward + (1 - done.float()) * self.gamma * next_Q).float()
+    
+class Mario(Mario):
+    def __init__(self, state_dim, action_dim, save_dir):
+        super().__init__(state_dim, action_dim, save_dir)
+        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
+        self.loss_fn = torch.nn.SmoothL1Loss()
 
     def update_Q_online(self, td_estimate, td_target):
         loss = self.loss_fn(td_estimate, td_target)
@@ -305,34 +359,60 @@ class Mario:
     def sync_Q_target(self):
         self.net.target.load_state_dict(self.net.online.state_dict())
 
-    def save(self):
-        save_path = (
-            self.save_dir / f"mario_net_{int(self.curr_step // self.save_every)}.chkpt"
-        )
-        torch.save(
-            dict(model=self.net.state_dict(), exploration_rate=self.exploration_rate),
-            save_path,
-        )
-        # print(f"MarioNet saved to {save_path} at step {self.curr_step}")
+
+class Mario(Mario):
+    def save(self, save_path):
+        if save_path is None:
+            try:
+                save_path = os.path.join(self.save_dir, f"mario_net_{self.curr_step}.chkpt")
+            except AttributeError:
+                save_path = os.path.join(self.save_dir, f"mario_net_{self.curr_step}.chkpt")
+        else:
+            save_path = os.path.join(save_path, f"mario_net_{self.curr_step}.chkpt")
+        print(f"Saving MarioNet at {save_path}")
+        # Only save the serializable parts
+        torch.save({
+            'model': self.net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+            'exploration_rate': self.exploration_rate
+        }, save_path)
+        print(f"MarioNet saved to {save_path} at step {self.curr_step}")
+
+
 
     def load(self, load_path):
-        # if not load_path.exists():
-        #     raise ValueError(f"{load_path} does not exist")
+        if not os.path.exists(load_path):
+            print(f"Load path {load_path} does not exist. Starting from scratch.")
+            return
 
-        ckp = torch.load(load_path, map_location=('cuda'))
+        ckp = torch.load(load_path, map_location=('cuda' if torch.cuda.is_available() else 'cpu'))
         exploration_rate = ckp.get('exploration_rate')
         state_dict = ckp.get('model')
 
         print(f"Loading model at {load_path} with exploration rate {exploration_rate}")
         self.net.load_state_dict(state_dict)
         self.exploration_rate = exploration_rate
+        self.optimizer.load_state_dict(ckp.get('optimizer_state_dict'))
+        # self.memory = ckp.get('memory')  # Uncomment if you want to load memory as well
 
-    def learn(self):
+
+class Mario(Mario):
+    def __init__(self, state_dim, action_dim, save_dir, load_path=None):
+        super().__init__(state_dim, action_dim, save_dir)
+        self.burnin = 1e4  # min. experiences before training
+        self.learn_every = 3  # no. of experiences between updates to Q_online
+        self.sync_every = 1e4  # no. of experiences between Q_target & Q_online sync
+
+         # Only attempt to load if a valid load_path is provided
+        if load_path and os.path.exists(load_path):
+            self.load(load_path)
+            
+    def learn(self, save_path):
         if self.curr_step % self.sync_every == 0:
             self.sync_Q_target()
 
         if self.curr_step % self.save_every == 0:
-            self.save()
+            self.save(save_path=save_path)
 
         if self.curr_step < self.burnin:
             return None, None
@@ -354,12 +434,6 @@ class Mario:
 
         return (td_est.mean().item(), loss)
 
-"""Logging
---------------
-
-
-
-"""
 
 import numpy as np
 import time, datetime
@@ -462,20 +536,19 @@ class MetricLogger:
                 f"{datetime.datetime.now().strftime('%Y-%m-%dT%H:%M:%S'):>20}\n"
             )
 
-        for metric in ["ep_rewards", "ep_lengths", "ep_avg_losses", "ep_avg_qs"]:
-            plt.plot(getattr(self, f"moving_avg_{metric}"))
-            plt.savefig(getattr(self, f"{metric}_plot"))
+        for metric in ["ep_lengths", "ep_avg_losses", "ep_avg_qs", "ep_rewards"]:
             plt.clf()
+            plt.plot(getattr(self, f"moving_avg_{metric}"), label=f"moving_avg_{metric}")
+            plt.legend()
+            plt.savefig(getattr(self, f"{metric}_plot"))
 
-"""Let’s play!
-'''''''''''''''
+save_dir = Path("checkpoints") #/ datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
+if not os.path.exists(save_dir):
+  save_dir.mkdir(parents=True)
+print(f'All weights will saved at {save_dir}')
 
-In this example we run the training loop for 10 episodes, but for Mario to truly learn the ways of
-his world, we suggest running the loop for at least 40,000 episodes!
-
-
-
-"""
+# Initialize mario, this will re-init the weight
+mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir)
 
 use_cuda = torch.cuda.is_available()
 print(f"Using CUDA: {use_cuda}")
@@ -483,111 +556,67 @@ print()
 import warnings
 save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 save_dir.mkdir(parents=True)
-# from this
-# load_path = "checkpoints2/2023-11-15T02-22-09/mario_net_183.chkpt"
-# resume from this
-# load_path = "checkpoints/2023-11-16T03-40-58/mario_net_53.chkpt"
-# load_path = "checkpoints/1st_a/mario_net_272.chkpt"
-load_path = "checkpoints/2023-11-24T18-30-10/mario_net_6.chkpt"
+
+
+load_path = ""
+
 
 
 mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir)
 mario.load(load_path)
 
+'''Training Mario'''
 logger = MetricLogger(save_dir)
 
-# learning_rates = [0.001, 0.0001, 0.00001]
-# Episode 0 - Step 102 - Epsilon 0.09999745003219312 - Mean Reward 618.0 - Mean Length 102.0 - Mean Loss 0.0 - Mean Q Value 0.0 - Time Delta 3.001 - Time 2023-11-16T03:34:00
-# Results for learning rate 0.001:
-# Final mean reward: 1334.700
-# Final mean length: 222.900
-# Final mean loss: 0.000
-# Final mean Q value: 0.000
 
-# Episode 0 - Step 4556 - Epsilon 0.09988616482719233 - Mean Reward 1300.952 - Mean Length 216.952 - Mean Loss 0.0 - Mean Q Value 0.0 - Time Delta 44.666 - Time 2023-11-16T03:34:45
-# Results for learning rate 0.0001:
-# Final mean reward: 1310.500
-# Final mean length: 283.325
-# Final mean loss: 0.173
-# Final mean Q value: 7.498
-
-# Episode 0 - Step 11567 - Epsilon 0.09971124267208738 - Mean Reward 1316.366 - Mean Length 282.122 - Mean Loss 0.194 - Mean Q Value 8.551 - Time Delta 73.154 - Time 2023-11-16T03:35:58
-# Finished level!
-# MarioNet saved to checkpoints/2023-11-16T03-33-56/mario_net_1.chkpt at step 15000
-# Results for learning rate 1e-05:
-# Final mean reward: 1332.250
-# Final mean length: 264.083
-# Final mean loss: 0.419
-# Final mean Q value: 22.506
 imgs = [env.render()]
 
 mario.optimizer = torch.optim.Adam(mario.net.parameters(), lr=0.001)
-# def animate(imgs, video_name=None):
-#     # using cv2 to generate videos
-#     import cv2
-#     import os
-#     import string
-#     import random
-#     video_name = video_name if video_name is not None else ''.join(random.choice(string.ascii_letters) for i in range(18))+'.webm'
-#     height, width, layers = imgs[0].shape
-#     video = cv2.VideoWriter(video_name, cv2.VideoWriter_fourcc(*'VP80'), 20, (width,height))
-#     for img in imgs:
-#         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-#         video.write(img)
-#     video.release()
+
 
 
 # Run training episodes
-episodes = 100000
+episodes = 1000
 step_starting_index = 0
 
 episode_index = 0
 
 for e in range(episodes):
-    warnings.filterwarnings("ignore", category=UserWarning)
+
+    print(f"Episode {e}")
+
     state = env.reset()
 
+    # Play the game!
     while True:
+
+        # Run agent on the state
         action = mario.act(state)
-        next_state, reward, done, info = env.step(action)
-        # print(f"{next_state.shape},\n {reward},\n {done},\n {info}")
+
+        # Agent performs action
+        next_state, reward, done, trunc, info = env.step(action)
+
+        # Remember
         mario.cache(state, next_state, action, reward, done)
-        q, loss = mario.learn()
+
+        # Learn
+        q, loss = mario.learn(save_path=save_dir)
+
+        # Logging
         logger.log_step(reward, loss, q)
+
+        # Update state
         state = next_state
-        if info["flag_get"]:
-            # print("Finished level!")
-            break
 
-        if done:
-
+        # Check if end of game
+        if done or info["flag_get"]:
             break
 
     logger.log_episode()
 
     if e % 20 == 0:
-        # env.save_video()
-        # env.render()
-        # video = VideoRecorder(env, path=f"videos/{e}.mp4", enabled=True, video_codec='libx264',)
-        # video.capture_frame()
         logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
-        # video.close()
-        # del imgs
-        # imgs = [env.render()]
-# Save or print results for each learning rate
-# print(f"Results for learning rate {lr}:")
-# print(f"Final mean reward: {np.mean(logger.ep_rewards[-100:]):.3f}")
-# print(f"Final mean length: {np.mean(logger.ep_lengths[-100:]):.3f}")
-# print(f"Final mean loss: {np.mean(logger.ep_avg_losses[-100:]):.3f}")
-# print(f"Final mean Q value: {np.mean(logger.ep_avg_qs[-100:]):.3f}")
-# print("")
-
-"""Conclusion
-'''''''''''''''
-
-In this tutorial, we saw how we can use PyTorch to train a game-playing AI. You can use the same methods
-to train an AI to play any of the games at the `OpenAI gym <https://gym.openai.com/>`__. Hope you enjoyed this tutorial, feel free to reach us at
-`our github <https://github.com/yuansongFeng/MadMario/>`__!
 
 
-"""
+# Save the model
+mario.save(save_path=save_dir)
