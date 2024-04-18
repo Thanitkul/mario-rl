@@ -23,11 +23,14 @@ from gym.wrappers.monitoring.video_recorder import VideoRecorder
 import gym_super_mario_bros
 
 from tensordict import TensorDict
-from torchrl.data import TensorDictReplayBuffer, LazyMemmapStorage
+import torch.nn.functional as F
+
 
 import matplotlib.pyplot as plt
 from PIL import Image
 print(gym.__version__)
+
+import logging
 
 
 
@@ -43,7 +46,10 @@ SAVE_PATH = '/mario_net_last.chkpt'
 # Limit the action-space to
 #   0. walk right
 #   1. jump right
-env = JoypadSpace(env, [["right"], ["right", "A"]])
+#   2. no movement
+#   3. go dowm right
+#   4. jump-run right 
+env = JoypadSpace(env, [["right"], ["right", "A"],  ['NOOP'], ['down'], ['right', 'A', 'B']])
 
 env.reset()
 next_state, reward, done, trunc, info = env.step(action=0)
@@ -100,46 +106,47 @@ class ResizeObservation(gym.ObservationWrapper):
 
     def observation(self, observation):
         transforms = T.Compose(
-            [T.Resize(self.shape), T.Normalize(0, 255)]
+            [T.Resize(self.shape, antialias=True), T.Normalize(0, 255)]
         )
         observation = transforms(observation).squeeze(0)
         return observation
+    
+class RewardWrapper(gym.Wrapper):
+    def __init__(self, env):
+        super().__init__(env)
+        self.previous_score = 0
+        self.coins_collected = 0
+
+    def step(self, action):
+        obs, reward, done, trunk ,info = self.env.step(action)
+        current_score = info.get('score', 0)
+        current_coins = info.get('coins', 0)
+
+        
+        # Add to reward for score increase
+        if current_score > self.previous_score:
+            reward += 10
+        # Add to reward for collecting coins
+        if current_coins > self.coins_collected:
+            reward += 5
+        
+        # Update the previous values
+        self.previous_score = current_score
+        self.coins_collected = current_coins
+
+        return obs, reward, done, trunk, info
 
 
 # Apply Wrappers to environment
 env = SkipFrame(env, skip=4)
 env = GrayScaleObservation(env)
 env = ResizeObservation(env, shape=84)
+env = RewardWrapper(env)
 if gym.__version__ < '0.26':
     env = FrameStack(env, num_stack=4, new_step_api=True)
 else:
     env = FrameStack(env, num_stack=4)  
 
-
-"""After applying the above wrappers to the environment, the final wrapped
-state consists of 4 gray-scaled consecutive frames stacked together, as
-shown above in the image on the left. Each time Mario makes an action,
-the environment responds with a state of this structure. The structure
-is represented by a 3-D array of size ``[4, 84, 84]``.
-
-.. figure:: /_static/img/mario_env.png
-   :alt: picture
-
-Agent
-'''''''''
-
-We create a class ``Mario`` to represent our agent in the game. Mario
-should be able to:
-
--  **Act** according to the optimal action policy based on the current
-   state (of the environment).
-
--  **Remember** experiences. Experience = (current state, current
-   action, reward, next state). Mario *caches* and later *recalls* his
-   experiences to update his action policy.
-
--  **Learn** a better action policy over time
-"""
 state = env.reset()
 
 # if gym.__version__ > '0.26': render got no rgb_array arg
@@ -172,6 +179,47 @@ print(img2.shape)
 plt.imshow(img2)
 
 np.any(img != img2)
+
+class PrioritizedReplayBuffer:
+    def __init__(self, size, alpha=0.6):
+        self.alpha = alpha  # Determines how much prioritization is used
+        self.buffer = []
+        self.priorities = []
+        self.max_size = size
+        self.next_idx = 0
+
+    def add(self, state, action, reward, next_state, done, error):
+        max_prio = max(self.priorities) if self.buffer else 1.0
+        if len(self.buffer) < self.max_size:
+            self.buffer.append((state, action, reward, next_state, done))
+            self.priorities.append(max_prio)
+        else:
+            self.buffer[self.next_idx] = (state, action, reward, next_state, done)
+            self.priorities[self.next_idx] = max_prio
+
+        self.next_idx = (self.next_idx + 1) % self.max_size
+
+    def sample(self, batch_size, beta=0.4):
+        if len(self.buffer) == 0:
+            return [], [], [], [], [], []
+
+        total = len(self.buffer)
+        probs = np.array(self.priorities) ** self.alpha
+        probs /= probs.sum()
+
+        indices = np.random.choice(total, batch_size, p=probs)
+        samples = [self.buffer[idx] for idx in indices]
+
+        weights = (total * probs[indices]) ** (-beta)
+        weights /= weights.max()
+        weights = np.array(weights, dtype=np.float32)
+
+        states, actions, rewards, next_states, dones = zip(*samples)
+        return np.array(states), np.array(actions), np.array(rewards), np.array(next_states), np.array(dones), indices, weights
+
+    def update_priorities(self, indices, errors):
+        for idx, error in zip(indices, errors):
+            self.priorities[idx] = error + 1e-5  # Avoid zero probability
 
 class Mario:
     def __init__():
@@ -206,8 +254,10 @@ class Mario:
         self.net = self.net.to(device=self.device)
 
         self.exploration_rate = 1
-        self.exploration_rate_decay = 0.99999975
-        self.exploration_rate_min = 0.1
+        self.exploration_rate_decay = 0.9999998
+        self.no_flag_hit_min_exploration_rate_min = 0.4
+        self.flag_hit_min_exploration_rate_min = 0.2
+        self.flag_hit = False  # Flag to check if flag has been reached
         self.curr_step = 0
 
         self.save_every = 25000  # no. of steps of experiences between saving Mario Net
@@ -234,9 +284,13 @@ class Mario:
             action_values = self.net(state, model="online")
             action_idx = torch.argmax(action_values, axis=1).item()
 
-        # decrease exploration_rate
+        if self.flag_hit:
+            min_rate = self.flag_hit_min_exploration_rate_min
+        else:
+            min_rate = self.no_flag_hit_min_exploration_rate_min
         self.exploration_rate *= self.exploration_rate_decay
-        self.exploration_rate = max(self.exploration_rate_min, self.exploration_rate)
+        self.exploration_rate = max(min_rate, self.exploration_rate)
+
 
         # increment step
         self.curr_step += 1
@@ -245,7 +299,7 @@ class Mario:
 class Mario(Mario):  # subclassing for continuity
     def __init__(self, state_dim, action_dim, save_dir):
         super().__init__(state_dim, action_dim, save_dir)
-        self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+        self.memory = PrioritizedReplayBuffer(100000, alpha=0.6)  # Assuming a buffer size of 100000
         self.batch_size = 32
 
     def cache(self, state, next_state, action, reward, done):
@@ -263,14 +317,72 @@ class Mario(Mario):  # subclassing for continuity
         state = first_if_tuple(state).__array__()
         next_state = first_if_tuple(next_state).__array__()
 
-        state = torch.tensor(state)
-        next_state = torch.tensor(next_state)
-        action = torch.tensor([action])
-        reward = torch.tensor([reward])
-        done = torch.tensor([done])
+        if info.get("flag_get"):  # Check if flag is reached
+            if not self.flag_hit:
+                self.flag_hit = True  # Update flag_hit status on first successful flag hit
+
+
+        # Convert to tensors and ensure they are on the correct device
+        state_tensor = torch.tensor(state, device=self.device).float().unsqueeze(0)  # Add batch dimension
+        next_state_tensor = torch.tensor(next_state, device=self.device).float().unsqueeze(0)
+        action_tensor = torch.tensor([action], device=self.device).unsqueeze(0)
+        reward_tensor = torch.tensor([reward], device=self.device).float()
+        done_tensor = torch.tensor([done], device=self.device).float()
+
+        # Get the output of the network
+        network_output = self.net(state_tensor, model="online")
+
+        # If the action tensor has one less dimension, add an extra dimension
+        if len(action_tensor.shape) < len(network_output.shape):
+            action_tensor = action_tensor.unsqueeze(-1)
+
+        # Now you can use gather
+        current_q_values = network_output.gather(1, action_tensor)
+
+        next_q_values = self.net(next_state_tensor, model="online").max(1)[0].detach()
+
+         # Calculate TD error: TD = r + gamma * max Q(s', a') * (1 - done) - Q(s, a)
+        td_error = reward_tensor + (self.gamma * next_q_values * (1 - done_tensor)) - current_q_values
+
+        # Calculate the initial error
+        initial_error = abs(td_error.item()) + 1e-5
 
         # self.memory.append((state, next_state, action, reward, done,))
-        self.memory.add(TensorDict({"state": state, "next_state": next_state, "action": action, "reward": reward, "done": done}, batch_size=[]))
+        self.memory.add(state, action, reward, next_state, done, initial_error)
+
+    def learn(self):
+        # Sample data from the buffer
+        states, actions, rewards, next_states, dones, indices, weights = self.memory.sample(self.batch_size)
+
+        # Convert sampled data to tensors and send them to the appropriate device
+        states = torch.tensor(states, dtype=torch.float32, device=self.device)
+        actions = torch.tensor(actions, dtype=torch.long, device=self.device)
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=self.device)
+        next_states = torch.tensor(next_states, dtype=torch.float32, device=self.device)
+        dones = torch.tensor(dones, dtype=torch.float32, device=self.device)
+        weights = torch.tensor(weights, dtype=torch.float32, device=self.device)
+
+        # Predict current Q-values for the batch and calculate the target values
+        current_q_values = self.net(states, model="online").gather(1, actions.unsqueeze(1)).squeeze(1)
+        next_q_values = self.net(next_states, model="online").max(1)[0]
+        td_targets = rewards + self.gamma * next_q_values * (1 - dones)
+
+        # Calculate the loss using the MSE loss that accounts for the importance-sampling weights
+        loss = (weights * F.mse_loss(current_q_values, td_targets.detach(), reduction='none')).mean()
+
+        # Backpropagate the loss to update the network
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+
+        # After updating the model, recalculate TD errors with the updated network weights
+        updated_current_q_values = self.net(states).gather(1, actions.unsqueeze(1)).squeeze(1)
+        updated_td_errors = td_targets - updated_current_q_values
+
+        # Update the priorities in the replay buffer with the new TD errors
+        self.memory.update_priorities(indices, updated_td_errors.abs().detach().cpu().numpy())
+
+        return loss.item()
 
     def recall(self):
         """
@@ -280,8 +392,12 @@ class Mario(Mario):  # subclassing for continuity
         # batch = random.sample(self.memory, self.batch_size)
         # state, next_state, action, reward, done = map(torch.stack, zip(*batch))
 
-        batch = self.memory.sample(self.batch_size).to(self.device)
-        state, next_state, action, reward, done = (batch.get(key) for key in ("state", "next_state", "action", "reward", "done"))
+        state, next_state, action, reward, done = self.memory.sample(self.batch_size)
+        state = state.to(self.device)
+        next_state = next_state.to(self.device)
+        action = action.to(self.device)
+        reward = reward.to(self.device)
+        done = done.to(self.device)
         return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
 
 class MarioNet(nn.Module):
@@ -553,14 +669,15 @@ mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=sav
 use_cuda = torch.cuda.is_available()
 print(f"Using CUDA: {use_cuda}")
 print()
+
 import warnings
 save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 save_dir.mkdir(parents=True)
 
 
-load_path = ""
 
 
+load_path = r""
 
 mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir)
 mario.load(load_path)
@@ -568,55 +685,73 @@ mario.load(load_path)
 '''Training Mario'''
 logger = MetricLogger(save_dir)
 
-
-imgs = [env.render()]
-
 mario.optimizer = torch.optim.Adam(mario.net.parameters(), lr=0.001)
 
+import cv2
 
+def animate(imgs, video_name):
+    height, width, layers = imgs[0].shape
+    video = cv2.VideoWriter(video_name, cv2.VideoWriter_fourcc(*'XVID'), 20, (width, height))
+    for img in imgs:
+        img = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR for OpenCV
+        video.write(img)
+    video.release()
+    print(f"Video saved as {video_name}")
 
 # Run training episodes
-episodes = 1000
-step_starting_index = 0
-
-episode_index = 0
+episodes = 10000
+save_freq = 1000
 
 for e in range(episodes):
+    state = env.reset()
+    imgs = []  # Initialize the frame list for this episode
 
     print(f"Episode {e}")
 
-    state = env.reset()
-
-    # Play the game!
     while True:
-
-        # Run agent on the state
         action = mario.act(state)
-
-        # Agent performs action
         next_state, reward, done, trunc, info = env.step(action)
 
-        # Remember
+
+        # Collect the current frame
+        img = env.render().copy()
+        imgs.append(img)
+
         mario.cache(state, next_state, action, reward, done)
-
-        # Learn
         q, loss = mario.learn(save_path=save_dir)
-
-        # Logging
         logger.log_step(reward, loss, q)
-
-        # Update state
         state = next_state
 
-        # Check if end of game
         if done or info["flag_get"]:
             break
 
     logger.log_episode()
 
+    # record every 20 episodes
     if e % 20 == 0:
         logger.record(episode=e, epsilon=mario.exploration_rate, step=mario.curr_step)
 
+    # Check if it's time to save
+    if (e + 1) % save_freq == 0 or e == episodes - 1:
+        # Add another subdirectory to save_dir, being number of episodes
+        original_save_dir = save_dir
+        save_dir = save_dir / f"episode_{e + 1}"
+        save_dir.mkdir(parents=True, exist_ok=True)  # Create the directory if it does not exist
 
-# Save the model
-mario.save(save_path=save_dir)
+        # Create video from collected images
+        video_path = save_dir / f"episode_{e + 1}.mp4"
+        video_path = str(video_path)
+        animate(imgs, video_name=video_path)
+
+        # Save the model
+        mario.save(save_path=save_dir)
+
+        # Reset the save_dir to the original for the next episode
+        save_dir = original_save_dir
+
+# Final save if not already saved on the last episode
+if episodes % save_freq != 0:
+    video_path = save_dir / f"episode_{episodes}.mp4"
+    video_path = str(video_path)
+    animate(imgs, video_name=video_path)
+    mario.save(save_path=save_dir)
