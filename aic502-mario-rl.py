@@ -596,8 +596,8 @@ def animate(imgs, video_name):
     print(f"Video saved as {video_name}")
 
 # Run training episodes
-episodes = 10000
-save_freq = 10
+episodes = 20000
+save_freq = 1000
 
 
 
