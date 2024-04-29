@@ -41,11 +41,10 @@ SAVE_PATH = '/mario_net_last.chkpt'
 
 # Limit the action-space to
 #   0. walk right
-#   1. jump right
-#   2. no movement
-#   3. go dowm right
-#   4. jump-run right 
-env = JoypadSpace(env, [["right"], ["right", "A"],  ['NOOP'], ['down'], ['right', 'A', 'B']])
+#   1. jump rightp
+#   2. go down 
+#   3. jump-run right 
+env = JoypadSpace(env, [["right"], ["right", "A"], ['down'], ['right', 'A', 'B']])
 
 env.reset()
 next_state, reward, done, trunc, info = env.step(action=0)
@@ -112,12 +111,20 @@ class RewardWrapper(gym.Wrapper):
         super().__init__(env)
         self.previous_score = 0
         self.coins_collected = 0
+        self.previous_x_position = 0
+        self.progress_normalization_factor = 20  # Example normalization factor
+
 
     def step(self, action):
         obs, reward, done, trunk ,info = self.env.step(action)
         current_score = info.get('score', 0)
         current_coins = info.get('coins', 0)
+        current_x_position = info.get('x_pos', 0)
 
+        # Normalize the reward for moving forward
+        forward_progress = current_x_position - self.previous_x_position
+        normalized_progress_reward = forward_progress / self.progress_normalization_factor
+        reward += normalized_progress_reward
         
         # Add to reward for score increase
         if current_score > self.previous_score:
@@ -125,10 +132,15 @@ class RewardWrapper(gym.Wrapper):
         # Add to reward for collecting coins
         if current_coins > self.coins_collected:
             reward += 5
-        
+
+        # Penalty for stagnation (no progress)
+        if forward_progress == 0:
+            reward -= 0.1  # Small penalty for no movement forward
+                
         # Update the previous values
         self.previous_score = current_score
         self.coins_collected = current_coins
+        self.previous_x_position = current_x_position
 
         return obs, reward, done, trunk, info
 
@@ -176,6 +188,98 @@ plt.imshow(img2)
 
 np.any(img != img2)
 
+class SumTree:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1)
+        self.data = np.zeros(capacity, dtype=object)
+        self.write = 0
+        self.n_entries = 0
+
+    def _propagate(self, idx, change):
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def _retrieve(self, idx, s):
+        left = 2 * idx + 1
+        right = left + 1
+        if left >= len(self.tree):
+            return idx
+        if s <= self.tree[left]:
+            return self._retrieve(left, s)
+        else:
+            return self._retrieve(right, s - self.tree[left])
+
+    def add(self, p, data):
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, p)
+
+        self.write += 1
+        if self.write >= self.capacity:
+            self.write = 0
+        if self.n_entries < self.capacity:
+            self.n_entries += 1
+
+    def update(self, idx, p):
+        change = p - self.tree[idx]
+        self.tree[idx] = p
+        self._propagate(idx, change)
+
+    def get(self, s):
+        idx = self._retrieve(0, s)
+        data_idx = idx - self.capacity + 1
+        return (idx, self.tree[idx], self.data[data_idx])
+
+    def total_priority(self):
+        return self.tree[0]  # the root
+    
+class PERBuffer:
+    epsilon = 0.01  # small amount to avoid zero priority
+    alpha = 0.6     # [0..1] convert the importance of TD error to priority
+    beta = 0.4      # importance-sampling, from initial value increasing to 1
+    beta_increment_per_sampling = 0.001
+
+    def __init__(self, capacity):
+        self.tree = SumTree(capacity)
+
+    def _get_priority(self, error):
+        # Ensure error is a scalar by taking the absolute value and raising it to the power of alpha
+        # If error is a tensor, make sure it is moved to CPU and converted to numpy
+        if isinstance(error, torch.Tensor):
+            error = error.cpu().detach().numpy()
+            if error.size == 1:
+                error = error.item()  # Convert single-element tensor to scalar
+            else:
+                error = error.mean().item()  # Reduce tensor to mean and then convert to scalar
+        return (abs(error) + self.epsilon) ** self.alpha
+
+    def add(self, error, sample):
+        p = self._get_priority(error)
+        self.tree.add(p, sample)
+
+    def sample(self, n):
+        batch = []
+        segment = self.tree.total_priority() / n
+        self.beta = np.min([1., self.beta + self.beta_increment_per_sampling])
+
+        for i in range(n):
+            a = segment * i
+            b = segment * (i + 1)
+            s = np.random.uniform(a, b)
+            (idx, p, data) = self.tree.get(s)
+            sampling_probabilities = p / self.tree.total_priority()
+            is_weight = np.power(self.tree.n_entries * sampling_probabilities, -self.beta)
+            batch.append((idx, data, is_weight))
+        return batch
+
+    def update(self, idx, error):
+        p = self._get_priority(error)
+        self.tree.update(idx, p)
+
+
 class Mario:
     def __init__():
         pass
@@ -209,13 +313,13 @@ class Mario:
         self.net = self.net.to(device=self.device)
 
         self.exploration_rate = 1
-        self.exploration_rate_decay = 0.9999998
-        self.no_flag_hit_min_exploration_rate_min = 0.4
+        self.exploration_rate_decay = 0.99999975
+        self.no_flag_hit_min_exploration_rate_min = 0.3
         self.flag_hit_min_exploration_rate_min = 0.2
         self.flag_hit = False  # Flag to check if flag has been reached
         self.curr_step = 0
 
-        self.save_every = 25000  # no. of steps of experiences between saving Mario Net
+        self.save_every = 50000  # no. of steps of experiences between saving Mario Net
 
         self.use_cuda = torch.cuda.is_available()
 
@@ -254,7 +358,8 @@ class Mario:
 class Mario(Mario):  # subclassing for continuity
     def __init__(self, state_dim, action_dim, save_dir):
         super().__init__(state_dim, action_dim, save_dir)
-        self.memory = TensorDictReplayBuffer(storage=LazyMemmapStorage(100000, device=torch.device("cuda" if torch.cuda.is_available() else "cpu")))
+        self.memory = PERBuffer(100000)  # Using PERBuffer instead of simple ReplayBuffer
+        self.max_priority = 1.0  # Start with a high priority for the first experience
         self.batch_size = 32
 
     def cache(self, state, next_state, action, reward, done):
@@ -283,8 +388,9 @@ class Mario(Mario):  # subclassing for continuity
         reward = torch.tensor([reward])
         done = torch.tensor([done])
 
-        # self.memory.append((state, next_state, action, reward, done,))
-        self.memory.add(TensorDict({"state": state, "next_state": next_state, "action": action, "reward": reward, "done": done}, batch_size=[]))
+        experience = (state, next_state, action, reward, done)
+        self.memory.add(self.max_priority, experience)  # Store with max priority initially
+
 
     def recall(self):
         """
@@ -294,9 +400,12 @@ class Mario(Mario):  # subclassing for continuity
         # batch = random.sample(self.memory, self.batch_size)
         # state, next_state, action, reward, done = map(torch.stack, zip(*batch))
 
-        batch = self.memory.sample(self.batch_size).to(self.device)
-        state, next_state, action, reward, done = (batch.get(key) for key in ("state", "next_state", "action", "reward", "done"))
-        return state, next_state, action.squeeze(), reward.squeeze(), done.squeeze()
+        batch = self.memory.sample(self.batch_size)
+        state, next_state, action, reward, done, weights, indices = map(np.array, zip(*[(s[1][0], s[1][1], s[1][2], s[1][3], s[1][4], s[2], s[0]) for s in batch]))
+
+        weights = torch.tensor(weights, dtype=torch.float, device=self.device)
+
+        return state, next_state, action, reward, done, weights, indices
 
 class MarioNet(nn.Module):
     """mini CNN structure
@@ -305,6 +414,7 @@ class MarioNet(nn.Module):
 
     def __init__(self, input_dim, output_dim):
         super().__init__()
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         c, h, w = input_dim
 
         if h != 84:
@@ -332,6 +442,10 @@ class MarioNet(nn.Module):
             p.requires_grad = False
 
     def forward(self, input, model):
+        if not isinstance(input, torch.Tensor):
+            input = torch.tensor(input, device=self.device, dtype=torch.float)
+        else:
+            input = input.to(device=self.device, dtype=torch.float)
         if model == "online":
             return self.online(input)
         elif model == "target":
@@ -350,6 +464,9 @@ class Mario(Mario):
 
     @torch.no_grad()
     def td_target(self, reward, next_state, done):
+        reward = torch.tensor(reward, device=self.device).float()
+        done = torch.tensor(done, device=self.device).float()
+        next_state = torch.tensor(next_state, device=self.device).float()
         next_state_Q = self.net(next_state, model="online")
         best_action = torch.argmax(next_state_Q, axis=1)
         next_Q = self.net(next_state, model="target")[
@@ -360,8 +477,8 @@ class Mario(Mario):
 class Mario(Mario):
     def __init__(self, state_dim, action_dim, save_dir):
         super().__init__(state_dim, action_dim, save_dir)
-        self.optimizer = torch.optim.Adam(self.net.parameters(), lr=0.00025)
-        self.loss_fn = torch.nn.CrossEntropyLoss()
+        self.optimizer = torch.optim.AdamW(self.net.parameters(), lr=0.00025)
+        self.loss_fn = torch.nn.SmoothL1Loss()
 
     def update_Q_online(self, td_estimate, td_target):
         loss = self.loss_fn(td_estimate, td_target)
@@ -435,7 +552,7 @@ class Mario(Mario):
             return None, None
 
         # Sample from memory
-        state, next_state, action, reward, done = self.recall()
+        state, next_state, action, reward, done, weights, indices = self.recall()
 
         # Get TD Estimate
         td_est = self.td_estimate(state, action)
@@ -443,10 +560,25 @@ class Mario(Mario):
         # Get TD Target
         td_tgt = self.td_target(reward, next_state, done)
 
-        # Backpropagate loss through Q_online
-        loss = self.update_Q_online(td_est, td_tgt)
+        # Update Q-online
+        loss = self.update_Q_online(td_est, td_tgt, weights)
+
+        # Update priorities in the PER buffer
+        errors = td_tgt - td_est
+        for i in range(len(indices)):
+            self.memory.update(indices[i], errors[i])
 
         return (td_est.mean().item(), loss)
+    
+    def update_Q_online(self, td_estimate, td_target, weights):
+        td_estimate = td_estimate.cpu()  # move td_estimate to the CPU
+        td_target = td_target.cpu()  # move td_target to the CPU
+        loss = self.loss_fn(td_estimate, td_target) * weights
+        loss = loss.mean()
+        self.optimizer.zero_grad()
+        loss.backward()
+        self.optimizer.step()
+        return loss.item()
 
 
 import numpy as np
@@ -563,16 +695,16 @@ print(f'All weights will saved at {save_dir}')
 
 # Initialize mario, this will re-init the weight
 mario = Mario(state_dim=(4, 84, 84), action_dim=env.action_space.n, save_dir=save_dir)
-
 use_cuda = torch.cuda.is_available()
 print(f"Using CUDA: {use_cuda}")
+
 print()
 import warnings
 save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
 save_dir.mkdir(parents=True)
 
 
-load_path = r"D:\cmkl\AIC-502\mario-rl\checkpoints\2024-04-18T02-36-02\mario_net_4106.chkpt"
+load_path = r"D:\cmkl\AIC-502\mario-rl\checkpoints\60000ep\episode_60000\mario_net_8310445.chkpt"
 
 
 
@@ -596,7 +728,7 @@ def animate(imgs, video_name):
     print(f"Video saved as {video_name}")
 
 # Run training episodes
-episodes = 20000
+episodes = 60000
 save_freq = 1000
 
 
@@ -605,7 +737,7 @@ for e in range(episodes):
     state = env.reset()
     imgs = []  # Initialize the frame list for this episode
 
-    print(f"Episode {e}")
+    #print(f"Episode {e}")
 
     while True:
         action = mario.act(state)

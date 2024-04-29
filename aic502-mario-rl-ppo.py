@@ -1,128 +1,138 @@
-import os
 import gym
-from stable_baselines3 import PPO
-from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.env_util import make_vec_env
-from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from stable_baselines3.common import env_checker
 import gym_super_mario_bros
+import gym.version
+from gym.wrappers import FrameStack, GrayScaleObservation, ResizeObservation
 from nes_py.wrappers import JoypadSpace
-from gym.wrappers import FrameStack 
-import cv2
-from pathlib import Path
-import datetime
 import numpy as np
-from gym.spaces import Box
+from gym import spaces
+from stable_baselines3.common.atari_wrappers import AtariWrapper
+from stable_baselines3.common.vec_env import VecFrameStack, DummyVecEnv, SubprocVecEnv
+from stable_baselines3 import PPO
+from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import VecVideoRecorder
+
+
+
+import cv2
+
+print(gym.__version__)
 
 
 class SkipFrame(gym.Wrapper):
     def __init__(self, env, skip):
+        """Return only every `skip`-th frame"""
         super().__init__(env)
         self._skip = skip
 
     def step(self, action):
+        """Repeat action, and sum reward"""
         total_reward = 0.0
-        for _ in range(self._skip):
-            obs, reward, done, info = self.env.step(action)
+        for i in range(self._skip):
+            # Accumulate reward and repeat the same action
+            obs, reward, done, trunk, info = self.env.step(action)
             total_reward += reward
             if done:
                 break
-        return obs, total_reward, done, info
-
-    def reset(self, **kwargs):
-        return self.env.reset(**kwargs)
-
-class GrayScaleObservation(gym.ObservationWrapper):
+        return obs, total_reward, done, trunk, info
+    
+class RewardWrapper(gym.Wrapper):
     def __init__(self, env):
         super().__init__(env)
-        obs_shape = self.observation_space.shape[:2]
-        self.observation_space = Box(low=0, high=255, shape=obs_shape, dtype=np.uint8)
+        self.previous_score = 0
+        self.coins_collected = 0
 
-    def observation(self, observation):
-        return np.dot(observation[..., :3], [0.2989, 0.5870, 0.1140])
+    def step(self, action):
+        obs, reward, done, trunk ,info = self.env.step(action)
+        current_score = info.get('score', 0)
+        current_coins = info.get('coins', 0)
 
-    def reset(self, **kwargs):
-        observation = self.env.reset(**kwargs)
-        return self.observation(observation)
+        
+        # Add to reward for score increase
+        if current_score > self.previous_score:
+            reward += 10
+        # Add to reward for collecting coins
+        if current_coins > self.coins_collected:
+            reward += 5
+        
+        # Update the previous values
+        self.previous_score = current_score
+        self.coins_collected = current_coins
 
-class ResizeObservation(gym.ObservationWrapper):
-    def __init__(self, env, shape):
+        return obs, reward, done, trunk, info
+    
+class ReshapeObservations(gym.ObservationWrapper):
+    def __init__(self, env, new_shape):
         super().__init__(env)
-        self.shape = (shape, shape) if isinstance(shape, int) else tuple(shape)
-        self.observation_space = Box(low=0, high=255, shape=(1,) + self.shape, dtype=np.uint8)
+        self.new_shape = new_shape
+        self.observation_space = gym.spaces.Box(low=0, high=255, shape=new_shape, dtype=np.uint8)
 
     def observation(self, observation):
-        from PIL import Image
-        observation = Image.fromarray(observation)
-        observation = observation.resize(self.shape)
-        return np.array(observation, dtype=np.uint8)[np.newaxis, ...]
-
-    def reset(self, **kwargs):
-        observation = self.env.reset(**kwargs)
-        return self.observation(observation)
+        return observation.reshape(self.new_shape)
 
 
+class TensorboardCallback(BaseCallback):
+    def __init__(self, verbose=0):
+        super(TensorboardCallback, self).__init__(verbose)
 
-def create_environment():
-    env = gym_super_mario_bros.make('SuperMarioBros-1-1-v0')
-    env = JoypadSpace(env, [["right"], ["right", "A"], ["NOOP"], ["down"], ["right", "A", "B"]])
-    env = SkipFrame(env, skip=4)
-    env = GrayScaleObservation(env)
-    env = ResizeObservation(env, shape=84)
-    env = FrameStack(env, num_stack=4)
-    return env
+    def _on_step(self) -> bool:
+        self.logger.record('reward', np.mean(self.training_env.get_attr('reward')))
+        return True 
+    
 
-np.random.seed(np.random.randint(0, 2**31 - 1))
-# Initialize environment with wrappers
-env = make_vec_env(lambda: create_environment(), n_envs=1)
 
-# Check the environment for compatibility with Stable Baselines
-#check = env_checker.check_env(env, warn=True, skip_render_check=True)
 
-# Define save directory
-save_dir = Path("checkpoints") / datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
-save_dir.mkdir(parents=True, exist_ok=True)
 
-# Initialize PPO model
-model = PPO("MlpPolicy", env, verbose=1, tensorboard_log="./ppo_supermario_tensorboard/")
 
-# Callback for saving models
-checkpoint_callback = CheckpointCallback(save_freq=10000, save_path=str(save_dir),
-                                         name_prefix='ppo_supermario')
+def record_video(env_id, model, video_length=500, video_folder='videos/', video_name='mario_video'):
+    env = DummyVecEnv([lambda: gym.make(env_id)])
+    env = VecVideoRecorder(env, video_folder,
+                           record_video_trigger=lambda x: x == 0, video_length=video_length,
+                           name_prefix=video_name)
 
-# Function to save video of episodes using the environment's render method
-def record_video(env, model, video_length=500, prefix='', video_folder='videos/'):
-    os.makedirs(video_folder, exist_ok=True)
-    images = []
     obs = env.reset()
-    img = env.render(mode='rgb_array')
-    for i in range(video_length):
-        images.append(img)
-        action, _ = model.predict(obs)
-        obs, _, _, _ = env.step(action)
-        img = env.render(mode='rgb_array')
+    for _ in range(video_length):
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, done, _ = env.step(action)
+        if done:
+            obs = env.reset()
 
-    height, width, layers = images[0].shape
-    video_name = f"{video_folder}/{prefix}_episode.mp4"
-    video = cv2.VideoWriter(video_name, cv2.VideoWriter_fourcc(*'mp4v'), 30, (width, height))
-    for image in images:
-        video.write(cv2.cvtColor(image, cv2.COLOR_RGB2BGR))
-    video.release()
-    print(f"Video saved as {video_name}")
+    env.close()
 
-# Callback for evaluating and recording videos
-eval_callback = EvalCallback(env, best_model_save_path=str(save_dir),
-                             log_path=str(save_dir), eval_freq=10000,
-                             deterministic=True, render=False)
 
-# Training the model
-model.learn(total_timesteps=250000, callback=[checkpoint_callback, eval_callback])
+if __name__ == '__main__':
+    '''
+    if gym.__version__ < '0.26':
+        env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0")
+        print(1)
+    else:
+        env = gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='rgb_array', apply_api_compatibility=True)
+        print(2)
+    '''
 
-# Save the final model
-model.save(save_dir / "final_ppo_supermario")
+    #env = JoypadSpace(env, [["right"], ["right", "A"],  ['NOOP'], ['down'], ['right', 'A', 'B']])
 
-# Optionally, record a video from the final model
-record_video(env, model, video_folder=str(save_dir))
+    #env = SkipFrame(env, skip=4)
+    #env = GrayScaleObservation(env, keep_dim=True)
+    #env = ResizeObservation(env, shape=84)
+    #env = RewardWrapper(env)
+    
+    env = SubprocVecEnv([lambda: gym_super_mario_bros.make("SuperMarioBros-1-1-v0", render_mode='rgb_array', apply_api_compatibility=True) for i in range(4)])
 
-# Close the environment
-env.close()
+    print(env.observation_space.shape)
+
+    #env = VecFrameStack(env, n_stack=4, channels_order='last')
+
+    print(env.observation_space.shape)
+
+    env.reset()
+    print(env.observation_space.shape)
+    obs, reward, done, info = env.step(actions=0)
+    print(f"{obs.shape},\n {reward},\n ,\n {info}")
+    
+
+    model = PPO('CnnPolicy', env, verbose=1, learning_rate=1e-5, n_steps=512) 
+    model.learn(total_timesteps=2000000, callback=TensorboardCallback())
+    model.save("ppo_mario")
+
+    env = VecFrameStack(env, n_stack=4)
+    record_video("SuperMarioBros-1-1-v0", model, video_length=500, video_name='ppo_mario')
